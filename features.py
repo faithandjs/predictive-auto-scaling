@@ -55,18 +55,22 @@ for idx, (vm_id, group) in enumerate(df.groupby('vm_id')):
         group[f'avg_cpu_roll_std_{window}'] = group['avg_cpu'].shift(1).rolling(window=window).std()
         group[f'max_cpu_roll_mean_{window}'] = group['max_cpu'].shift(1).rolling(window=window).mean()
 
-        # Delta features (rate of change)
-        group['avg_cpu_delta_1'] = group['avg_cpu'] - group['avg_cpu_lag_1']
-        group['avg_cpu_delta_3'] = group['avg_cpu'] - group['avg_cpu_lag_3']
+    # Delta features (rate of change)
+    group['avg_cpu_delta_1'] = group['avg_cpu'] - group['avg_cpu_lag_1']
+    group['avg_cpu_delta_3'] = group['avg_cpu'] - group['avg_cpu_lag_3']
 
-        # Temporal feature
-        group['time_of_day'] = group['timestamp'] % 86400
+    # Temporal feature
+    group['time_of_day'] = group['timestamp'] % 86400
 
-        # Target: CPU 15 minutes ahead
-        group['target_avg_cpu'] = group['avg_cpu'].shift(-FORECAST_HORIZON)
-        group['target_scale_event'] = (group['target_avg_cpu'] > 75).astype(int)
+    # Unscaled copy of current CPU (NOT a model feature) - used by the
+    # reactive baseline in simulate.py, which must compare real CPU % to 75
+    group['avg_cpu_raw'] = group['avg_cpu']
 
-        all_features.append(group)
+    # Target: CPU 15 minutes ahead
+    group['target_avg_cpu'] = group['avg_cpu'].shift(-FORECAST_HORIZON)
+    group['target_scale_event'] = (group['target_avg_cpu'] > 75).astype(int)
+
+    all_features.append(group)
 
 features_df = pd.concat(all_features, ignore_index=True)
 features_df = features_df.dropna()
@@ -81,7 +85,7 @@ print(f"Test: {len(test_df):,} rows ({test_df['vm_id'].nunique():,} VMs)")
 
 # Columns to scale (exclude IDs, timestamps, targets)
 feature_cols = [c for c in train_df.columns if c not in [
-    'vm_id', 'timestamp', 'datetime', 'min_cpu',
+    'vm_id', 'timestamp', 'datetime', 'min_cpu', 'avg_cpu_raw',
     'target_avg_cpu', 'target_scale_event', 'time_of_day'
 ]]
 

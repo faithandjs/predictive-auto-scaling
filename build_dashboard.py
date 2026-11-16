@@ -136,7 +136,8 @@ footer {{ text-align: center; padding: 2rem; color: #475569; font-size: 0.8rem; 
     <canvas id="confmat" style="margin-top:1rem"></canvas>
   </div>
   <div class="card"><h2>8. Decision Timeline (Single VM)</h2><canvas id="timeline"></canvas></div>
-  <div class="card"><h2>9. Model Comparison</h2><canvas id="comparison"></canvas></div>
+  <div class="card"><h2>9. Model Comparison</h2><canvas id="comparison"></canvas>
+    <p style="font-size:0.75rem;color:#94a3b8;margin-top:0.5rem">ARIMA forecasts cluster-mean CPU (aggregate), so its RMSE is not directly comparable and it has no F1/AUC.</p></div>
   <div class="card"><h2>10. Walk-Forward Validation</h2><canvas id="walkfwd"></canvas></div>
 </div>
 
@@ -254,11 +255,11 @@ if (DATA.model_comparison && DATA.model_comparison.models) {{
 if (DATA.walk_forward && DATA.walk_forward.mean_rmse) {{
   const wf = DATA.walk_forward;
   C('walkfwd', 'bar', {{
-    labels: ['Fold 1','Fold 2','Fold 3','Mean'],
+    labels: [...(wf.fold_rmse || []).map((_,i)=>'Fold '+(i+1)), 'Mean'],
     datasets: [{{
       label:'RMSE',
-      data:[wf.mean_rmse - wf.std_rmse, wf.mean_rmse, wf.mean_rmse + wf.std_rmse, wf.mean_rmse],
-      backgroundColor:['#38bdf888','#38bdf888','#38bdf888','#f59e0bcc']
+      data:[...(wf.fold_rmse || []), wf.mean_rmse],
+      backgroundColor:[...(wf.fold_rmse || []).map(()=>'#38bdf888'), '#f59e0bcc']
     }}]
   }}, {{scales:{{x:{{ticks:{{color:'#94a3b8'}}}},y:{{ticks:{{color:'#94a3b8'}}}}}}}});
 }}

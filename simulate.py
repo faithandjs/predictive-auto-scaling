@@ -199,10 +199,13 @@ comparison = {
     "rmse": [metrics['arima_aggregate_regression']['rmse'],
              metrics['xgb_regression']['rmse'],
              metrics['lstm_regression']['rmse']],
-    "f1":   [0.0, metrics['xgb_classification']['f1'],
-metrics['lstm_classification']['f1']],
-    "auc": [0.5, metrics['xgb_classification']['auc'],
-metrics['lstm_classification']['auc']]
+    # ARIMA forecasts cluster-level demand only, so it has no per-VM
+    # scale-event classification: F1/AUC are not applicable (null)
+    "f1":   [None, metrics['xgb_classification']['f1'],
+             metrics['lstm_classification']['f1']],
+    "auc":  [None, metrics['xgb_classification']['auc'],
+             metrics['lstm_classification']['auc']],
+    "note": "ARIMA RMSE is on cluster-mean CPU %, not per-VM CPU %"
 }
 with open(os.path.join(VIZ_DIR, "model_comparison.json"), 'w') as f:
     json.dump(comparison, f)

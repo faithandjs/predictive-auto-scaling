@@ -29,7 +29,7 @@ train_df = pd.read_parquet(os.path.join(FEATURES_DIR, "train.parquet"))
 test_df  = pd.read_parquet(os.path.join(FEATURES_DIR, "test.parquet"))
 
 FEATURE_COLS = [c for c in train_df.columns if c not in [
-    'vm_id', 'timestamp', 'datetime', 'min_cpu',
+    'vm_id', 'timestamp', 'datetime', 'min_cpu', 'avg_cpu_raw',
     'target_avg_cpu', 'target_scale_event'
 ]]
 
@@ -47,8 +47,8 @@ def regression_metrics(y_true, y_pred):
     mae  = float(mean_absolute_error(y_true, y_pred))
     return {'rmse': rmse, 'mae': mae}
 
-def classification_metrics(y_true, y_pred_prob):
-    y_pred = (y_pred_prob > 0.5).astype(int)
+def classification_metrics(y_true, y_pred_prob, threshold=0.5):
+    y_pred = (y_pred_prob > threshold).astype(int)
     return {
         'accuracy':  float(accuracy_score(y_true, y_pred)),
         'precision': float(precision_score(y_true, y_pred, zero_division=0)),
@@ -59,7 +59,7 @@ def classification_metrics(y_true, y_pred_prob):
 
 # ── MODEL 1: AGGREGATE ARIMA ─────────────────────────────────────────────────
 print("\n" + "=" * 60)
-print("MODEL 1: AGGREGATE ARIMA (Cluster-Level Demand)")
+print("MODEL 1: AGGREGATE ARIMA (Cluster-Level Mean CPU)")
 print("=" * 60)
 from statsmodels.tsa.arima.model import ARIMA
 
@@ -89,7 +89,10 @@ print("MODEL 2: XGBOOST + WALK-FORWARD VALIDATION")
 print("=" * 60)
 from xgboost import XGBRegressor, XGBClassifier
 
-# Walk-forward cross-validation (time-series safe)
+# Walk-forward cross-validation (time-series safe).
+# Rows must be in time order, otherwise TimeSeriesSplit splits by VM id
+# (the parquet is sorted by vm_id) rather than by time.
+train_df = train_df.sort_values(['timestamp', 'vm_id']).reset_index(drop=True)
 tscv = TimeSeriesSplit(n_splits=3)
 wf_scores = []
 for fold, (train_idx, val_idx) in enumerate(tscv.split(train_df)):
@@ -108,6 +111,7 @@ for fold, (train_idx, val_idx) in enumerate(tscv.split(train_df)):
 
 print(f"  Mean Walk-Forward RMSE: {np.mean(wf_scores):.4f} (+/- {np.std(wf_scores):.4f})")
 all_metrics['xgb_walk_forward'] = {
+    'fold_rmse': [float(s) for s in wf_scores],
     'mean_rmse': float(np.mean(wf_scores)),
     'std_rmse':  float(np.std(wf_scores))
 }
@@ -137,7 +141,9 @@ print(f"  XGBoost Reg  RMSE: {xgb_reg_metrics['rmse']:.4f}  MAE: {xgb_reg_metric
 print(f"  XGBoost Clf  F1:   {xgb_clf_metrics['f1']:.4f}   AUC: {xgb_clf_metrics['auc']:.4f}")
 
 # Save predictions & models
-xgb_results = test_df[['vm_id', 'timestamp', 'avg_cpu', 'target_avg_cpu', 'target_scale_event']].copy()
+# avg_cpu in test_df is standardised; save the real CPU % for the reactive baseline
+xgb_results = test_df[['vm_id', 'timestamp', 'avg_cpu_raw', 'target_avg_cpu', 'target_scale_event']].copy()
+xgb_results = xgb_results.rename(columns={'avg_cpu_raw': 'avg_cpu'})
 xgb_results['predicted_cpu']         = xgb_reg_pred
 xgb_results['predicted_scale_prob']  = xgb_clf_prob
 xgb_results['predicted_scale']       = (xgb_clf_prob > 0.5).astype(int)
@@ -155,6 +161,13 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import optuna
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+# On macOS, XGBoost and PyTorch each ship their own libomp; once XGBoost has
+# run in this process, multi-threaded PyTorch ops deadlock or segfault.
+# A single torch thread avoids the clash (the LSTM is small, so this is cheap).
+import sys
+if sys.platform == 'darwin':
+    torch.set_num_threads(1)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"  Device: {device}")
@@ -194,13 +207,24 @@ class LSTMModel(nn.Module):
         return self.fc2(out).squeeze()
 
 
+# Hold out the last 20% (by time) of the TRAINING data as a validation set
+# for Optuna and early stopping, so the test set is only used once, at the end.
+val_cut      = train_df['timestamp'].quantile(0.8)
+lstm_train_df = train_df[train_df['timestamp'] <= val_cut]
+lstm_val_df   = train_df[train_df['timestamp'] >  val_cut]
+print(f"  LSTM split: {len(lstm_train_df):,} train / {len(lstm_val_df):,} val / {len(test_df):,} test rows")
+
+
 def make_loaders(seq_len, batch):
-    X_tr, y_tr   = create_sequences(train_df, seq_len, FEATURE_COLS, 'target_avg_cpu')
-    X_val, y_val = create_sequences(test_df,  seq_len, FEATURE_COLS, 'target_avg_cpu')
+    X_tr, y_tr   = create_sequences(lstm_train_df, seq_len, FEATURE_COLS, 'target_avg_cpu')
+    X_val, y_val = create_sequences(lstm_val_df,   seq_len, FEATURE_COLS, 'target_avg_cpu')
+    X_te, y_te   = create_sequences(test_df,       seq_len, FEATURE_COLS, 'target_avg_cpu')
     tr_ds  = torch.utils.data.TensorDataset(torch.FloatTensor(X_tr),  torch.FloatTensor(y_tr))
     val_ds = torch.utils.data.TensorDataset(torch.FloatTensor(X_val), torch.FloatTensor(y_val))
+    te_ds  = torch.utils.data.TensorDataset(torch.FloatTensor(X_te),  torch.FloatTensor(y_te))
     return (DataLoader(tr_ds,  batch_size=batch, shuffle=True),
             DataLoader(val_ds, batch_size=batch),
+            DataLoader(te_ds,  batch_size=batch),
             X_val, y_val)
 
 
@@ -212,7 +236,7 @@ def objective(trial):
     batch   = trial.suggest_categorical('batch',    [64, 128])
     seq_len = trial.suggest_categorical('seq_len',  [3, 5])
 
-    train_loader, val_loader, X_val, y_val = make_loaders(seq_len, batch)
+    train_loader, val_loader, _, X_val, y_val = make_loaders(seq_len, batch)
     if len(X_val) == 0:
         return float('inf')
 
@@ -246,7 +270,7 @@ print(f"  Best params:    {best}")
 
 # Train final model with best hyperparameters
 print("  Training final LSTM...")
-train_loader, val_loader, X_val, y_val = make_loaders(best['seq_len'], best['batch'])
+train_loader, val_loader, test_loader, X_val, y_val = make_loaders(best['seq_len'], best['batch'])
 
 final_model = LSTMModel(len(FEATURE_COLS), best['hidden'], best['layers'], best['dropout']).to(device)
 optimizer   = torch.optim.Adam(final_model.parameters(), lr=best['lr'])
@@ -274,19 +298,22 @@ for epoch in range(20):
     if (epoch + 1) % 5 == 0:
         print(f"  Epoch {epoch+1}/20: Val Loss = {v:.4f}")
 
-# Evaluate LSTM
+# Evaluate LSTM on the held-out TEST set (never seen during tuning/early stopping)
 final_model.load_state_dict(torch.load(os.path.join(MODELS_DIR, "lstm_best.pt")))
 final_model.eval()
 lstm_preds, lstm_trues = [], []
 with torch.no_grad():
-    for bx, by in val_loader:
+    for bx, by in test_loader:
         bx = bx.to(device)
         lstm_preds.extend(final_model(bx).cpu().numpy())
         lstm_trues.extend(by.numpy())
 
 lstm_reg  = regression_metrics(np.array(lstm_trues), np.array(lstm_preds))
+# The LSTM is a regressor: use predicted CPU / 100 as a score for AUC, and the
+# same 75% cut-off as the target definition for the yes/no decision.
 lstm_prob = np.clip(np.array(lstm_preds) / 100, 0, 1)
-lstm_clf  = classification_metrics((np.array(lstm_trues) > 75).astype(int), lstm_prob)
+lstm_clf  = classification_metrics((np.array(lstm_trues) > 75).astype(int), lstm_prob,
+                                   threshold=0.75)
 all_metrics['lstm_regression']     = lstm_reg
 all_metrics['lstm_classification'] = lstm_clf
 print(f"  LSTM RMSE: {lstm_reg['rmse']:.4f}  F1: {lstm_clf['f1']:.4f}  AUC: {lstm_clf['auc']:.4f}")
@@ -312,16 +339,19 @@ class DriftDetector:
 
     def update(self, actual, predicted):
         error = abs(actual - predicted)
-        self.errors.append(error)
-        if len(self.errors) > self.window:
-            self.errors.pop(0)
+        # Compare against PREVIOUS errors only (including the current error in
+        # the baseline inflates the mean/std and hides real outliers)
+        drift = False
         if len(self.errors) >= 10:
             mean_err = np.mean(self.errors)
             std_err  = np.std(self.errors)
             if error > mean_err + self.threshold * std_err:
                 self.drift_count += 1
-                return True
-        return False
+                drift = True
+        self.errors.append(error)
+        if len(self.errors) > self.window:
+            self.errors.pop(0)
+        return drift
 
 
 detector = DriftDetector()

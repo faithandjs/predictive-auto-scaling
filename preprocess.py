@@ -96,10 +96,11 @@ df.to_parquet(os.path.join(CLEAN_DIR, "azure_vm_clean.parquet"), index=False)
 print(f"[SAVED] {CLEAN_DIR}/azure_vm_clean.parquet")
 
 
-# Save aggregate cluster demand (for ARIMA)
+# Save aggregate cluster demand (for ARIMA): mean CPU % across VMs, so its
+# RMSE is in the same units (CPU %) as the per-VM models
 cluster_demand = (
     df.groupby('timestamp')['avg_cpu']
-    .sum()
+    .mean()
     .reset_index()
     .sort_values('timestamp')
 )

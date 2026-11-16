@@ -8,7 +8,9 @@ Run with: python inference_api.py
 from fastapi import FastAPI
 from pydantic import BaseModel
 import numpy as np
+import pandas as pd
 import xgboost as xgb
+import pickle
 import time
 
 app = FastAPI(
@@ -24,6 +26,12 @@ reg_model.load_model("models/xgb_regressor.json")
 clf_model = xgb.Booster()
 clf_model.load_model("models/xgb_classifier.json")
 
+# The models were trained on standardised inputs, so the same scaler that
+# features.py fitted on the training data must be applied here.
+with open("data/features/scaler.pkl", "rb") as f:
+    scaler = pickle.load(f)
+SCALED_COLS = list(scaler.feature_names_in_)  # every feature except time_of_day
+
 # EXACT 19 feature names in EXACT order matching training
 FEATURE_NAMES = [
     'max_cpu', 'avg_cpu',
@@ -37,6 +45,7 @@ FEATURE_NAMES = [
 ]
 
 SCALE_THRESHOLD = 70.0  # 75% - 5% safety buffer
+MIN_HISTORY = 6         # current reading + 5 previous (needed for lag_5 / roll_5)
 
 
 class MetricsInput(BaseModel):
@@ -52,52 +61,53 @@ vm_history: dict = {}
 
 
 def build_features(history: list):
-    """Build the 19-feature vector from last 5 readings.
-    Returns None if insufficient history (triggers reactive fallback).
+    """Build the 19-feature vector exactly as features.py does, then scale it.
+
+    Mirrors training:
+      - lag_k     = value k readings before the current one
+      - roll_*_w  = stats over the w readings BEFORE the current one
+                    (features.py uses .shift(1).rolling(w)), std with ddof=1
+      - delta_k   = current avg_cpu - avg_cpu lag_k
+      - time_of_day is left unscaled (it was excluded from the scaler)
+    Returns None if there is not enough history (triggers reactive fallback).
     """
-    if len(history) < 5:
+    if len(history) < MIN_HISTORY:
         return None
 
-    recent = history[-5:]
-    avg_cpus = [h['avg_cpu'] for h in recent]
-    max_cpus = [h['max_cpu'] for h in recent]
+    avg = [h['avg_cpu'] for h in history]
+    mx  = [h['max_cpu'] for h in history]
 
-    features = [
-        max_cpus[-1],                                                # 1. max_cpu
-        avg_cpus[-1],                                                # 2. avg_cpu
-        avg_cpus[-2],                                                # 3. avg_cpu_lag_1
-        max_cpus[-2],                                                # 4. max_cpu_lag_1
-        avg_cpus[-3],                                                # 5. avg_cpu_lag_2
-        max_cpus[-3],                                                # 6. max_cpu_lag_2
-        avg_cpus[-4] if len(avg_cpus) > 3 else avg_cpus[-3],         # 7. avg_cpu_lag_3
-        max_cpus[-4] if len(max_cpus) > 3 else max_cpus[-3],         # 8. max_cpu_lag_3
-        avg_cpus[0],                                                 # 9. avg_cpu_lag_5
-        max_cpus[0],                                                 # 10. max_cpu_lag_5
-        np.mean(avg_cpus[-3:]),                                      # 11. avg_cpu_roll_mean_3
-        float(np.std(avg_cpus[-3:])) if len(avg_cpus) >= 3 else 0,   # 12. avg_cpu_roll_std_3
-        np.mean(max_cpus[-3:]),                                      # 13. max_cpu_roll_mean_3
-        np.mean(avg_cpus),                                           # 14. avg_cpu_roll_mean_5
-        float(np.std(avg_cpus)),                                     # 15. avg_cpu_roll_std_5
-        np.mean(max_cpus),                                           # 16. max_cpu_roll_mean_5
-        avg_cpus[-1] - avg_cpus[-2],                                 # 17. avg_cpu_delta_1
-        avg_cpus[-1] - avg_cpus[-4] if len(avg_cpus) > 3 else 0,     # 18. avg_cpu_delta_3
-        recent[-1]['timestamp'] % 86400                              # 19. time_of_day
-    ]
-    return features
+    f = {'max_cpu': mx[-1], 'avg_cpu': avg[-1]}
+    for lag in [1, 2, 3, 5]:
+        f[f'avg_cpu_lag_{lag}'] = avg[-1 - lag]
+        f[f'max_cpu_lag_{lag}'] = mx[-1 - lag]
+    for w in [3, 5]:
+        prev_avg = avg[-1 - w:-1]
+        prev_max = mx[-1 - w:-1]
+        f[f'avg_cpu_roll_mean_{w}'] = float(np.mean(prev_avg))
+        f[f'avg_cpu_roll_std_{w}']  = float(np.std(prev_avg, ddof=1))
+        f[f'max_cpu_roll_mean_{w}'] = float(np.mean(prev_max))
+    f['avg_cpu_delta_1'] = avg[-1] - f['avg_cpu_lag_1']
+    f['avg_cpu_delta_3'] = avg[-1] - f['avg_cpu_lag_3']
+    f['time_of_day'] = history[-1]['timestamp'] % 86400
+
+    row = pd.DataFrame([f])
+    row[SCALED_COLS] = scaler.transform(row[SCALED_COLS])
+    return row[FEATURE_NAMES].values.astype(float)[0]
 
 
 @app.post("/predict")
 async def predict(metrics: MetricsInput):
     """
     Main endpoint: receive current VM metrics, return scale-up decision.
-    Uses 15-minute-ahead CPU forecast; falls back to reactive if history < 5.
+    Uses 15-minute-ahead CPU forecast; falls back to reactive if history < 6.
     """
     start = time.time()
 
     # Update per-VM history (keep last 50 readings)
     if metrics.vm_id not in vm_history:
         vm_history[metrics.vm_id] = []
-    vm_history[metrics.vm_id].append(metrics.dict())
+    vm_history[metrics.vm_id].append(metrics.model_dump())
     vm_history[metrics.vm_id] = vm_history[metrics.vm_id][-50:]
 
     features = build_features(vm_history[metrics.vm_id])
