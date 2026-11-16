@@ -1,0 +1,16 @@
+{
+  "reactive": {
+    "tp": 0,
+    "fp": 0,
+    "fn": 1526,
+    "cost": 1526.0
+  },
+  "predictive": {
+    "tp": 1350,
+    "fp": 262,
+    "fn": 176,
+    "cost": 202.2
+  },
+  "cost_reduction_pct": 86.7,
+  "sla_reduction_pct": 88.5
+}

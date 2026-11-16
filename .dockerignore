@@ -1,0 +1,11 @@
+venv
+data/raw
+data/clean
+data/features
+__pycache__
+*.pyc
+.git
+dashboard.html
+visualisations
+results
+models
